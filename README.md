@@ -1,7 +1,7 @@
-# OpenCode configuration
+# OpenCode v2 configuration
 
-Global OpenCode settings, agents, commands, skills, and the artifact workflow
-used for software-engineering work.
+Global OpenCode v2 settings, agents, commands, skills, and the artifact
+workflow used for software-engineering work.
 
 ## Agents
 
