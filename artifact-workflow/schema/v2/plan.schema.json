@@ -1,0 +1,227 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencode.local/artifact-workflow/schema/v2/plan.schema.json",
+  "title": "Artifact-driven OpenCode task plan (v2)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "task",
+    "objective",
+    "criteria",
+    "constraints",
+    "decisions",
+    "guardrails",
+    "execution",
+    "notes",
+    "artifacts",
+    "session_handoff"
+  ],
+  "properties": {
+    "$schema": { "type": "string" },
+    "schema_version": { "const": 2 },
+    "task": { "$ref": "#/$defs/task" },
+    "objective": { "type": "string", "minLength": 1 },
+    "criteria": {
+      "type": "array",
+      "maxItems": 50,
+      "items": { "$ref": "#/$defs/criterion" }
+    },
+    "constraints": { "type": "array", "maxItems": 50, "items": { "type": "string", "maxLength": 280 } },
+    "decisions": { "type": "array", "maxItems": 50, "items": { "type": "string", "maxLength": 280 } },
+    "guardrails": { "$ref": "#/$defs/guardrails" },
+    "execution": { "$ref": "#/$defs/execution" },
+    "notes": { "type": "array", "maxItems": 200, "items": { "$ref": "#/$defs/note" } },
+    "artifacts": { "$ref": "#/$defs/artifacts" },
+    "session_handoff": { "$ref": "#/$defs/session_handoff" }
+  },
+  "$defs": {
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "slug", "title", "created_at", "updated_at", "workspace", "base_revision", "branch"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^[0-9]{8}T[0-9]{6}-[a-z0-9]+(?:-[a-z0-9]+)*$" },
+        "slug": { "type": "string", "minLength": 1, "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+        "title": { "type": "string", "minLength": 1 },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "workspace": { "type": "string", "minLength": 1 },
+        "base_revision": { "type": ["string", "null"] },
+        "branch": { "type": ["string", "null"] }
+      }
+    },
+    "criterion": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Acceptance criterion. Minted by the primary executor or the spec stage. Referenced by ID only.",
+      "required": ["id", "statement", "status"],
+      "properties": {
+        "id": { "type": "string", "pattern": "^AC-[0-9]+$" },
+        "statement": { "type": "string", "minLength": 1, "maxLength": 280 },
+        "status": { "enum": ["active", "superseded"] }
+      }
+    },
+    "guardrails": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "context_reset_threshold",
+        "context_reset_action",
+        "max_failed_validation_runs_per_step",
+        "max_consecutive_read_only_turns",
+        "terminal_task_states",
+        "single_writer",
+        "allow_unrequested_commits",
+        "allow_unrequested_pushes",
+        "validation_command_policy"
+      ],
+      "properties": {
+        "context_reset_threshold": { "const": 0.5 },
+        "context_reset_action": { "const": "stop_at_safe_boundary_and_request_explicit_new_session" },
+        "max_failed_validation_runs_per_step": { "type": "integer", "minimum": 1 },
+        "max_consecutive_read_only_turns": { "const": 6 },
+        "terminal_task_states": { "const": ["completed", "blocked"] },
+        "single_writer": { "const": true },
+        "allow_unrequested_commits": { "const": false },
+        "allow_unrequested_pushes": { "const": false },
+        "validation_command_policy": { "const": "approval_or_allowlist" }
+      }
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["phase", "current_step", "steps"],
+      "properties": {
+        "phase": { "enum": ["ready", "working", "blocked", "completed"] },
+        "current_step": { "type": ["integer", "null"], "minimum": 1 },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/step" }
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "status",
+        "risk",
+        "depends_on",
+        "satisfies",
+        "invariants",
+        "non_goals",
+        "edge_cases",
+        "regression_risks",
+        "changes",
+        "validation",
+        "validation_records",
+        "retry",
+        "status_history",
+        "notes"
+      ],
+      "properties": {
+        "id": { "type": "integer", "minimum": 1 },
+        "title": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["pending", "ready", "in_progress", "failed", "completed", "blocked", "skipped"] },
+        "risk": {
+          "description": "low: internal, reversible. med: user-visible behaviour, shared types, async flows. high: auth, secrets, persistence, migrations, billing, public contracts, concurrency.",
+          "enum": ["low", "med", "high"]
+        },
+        "depends_on": { "type": "array", "items": { "type": "integer", "minimum": 1 } },
+        "satisfies": {
+          "description": "Acceptance criterion IDs this step is expected to satisfy. References only; never mints.",
+          "type": "array",
+          "items": { "type": "string", "pattern": "^AC-[0-9]+$" }
+        },
+        "invariants": { "type": "array", "maxItems": 20, "items": { "type": "string", "minLength": 1, "maxLength": 280 } },
+        "non_goals": { "type": "array", "maxItems": 20, "items": { "type": "string", "minLength": 1, "maxLength": 280 } },
+        "edge_cases": { "type": "array", "maxItems": 20, "items": { "type": "string", "minLength": 1, "maxLength": 280 } },
+        "regression_risks": { "type": "array", "maxItems": 20, "items": { "type": "string", "minLength": 1, "maxLength": 280 } },
+        "changes": { "type": "array", "maxItems": 50, "items": { "type": "string", "maxLength": 280 } },
+        "validation": { "type": "array", "minItems": 1, "maxItems": 20, "items": { "type": "string", "minLength": 1, "maxLength": 280 } },
+        "validation_records": { "type": "array", "maxItems": 50, "items": { "$ref": "#/$defs/validation_record" } },
+        "retry": { "$ref": "#/$defs/retry" },
+        "status_history": { "type": "array", "minItems": 1, "maxItems": 200, "items": { "$ref": "#/$defs/status_history" } },
+        "notes": { "type": "array", "maxItems": 50, "items": { "type": "string", "maxLength": 280 } }
+      }
+    },
+    "validation_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "at", "command", "status", "summary", "output_path", "unverified"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "at": { "type": "string", "format": "date-time" },
+        "command": { "type": "string", "minLength": 1 },
+        "status": { "enum": ["passed", "failed", "blocked"] },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 280 },
+        "output_path": { "type": ["string", "null"] },
+        "unverified": {
+          "description": "What remains assumed rather than demonstrated. Empty array means explicitly nothing.",
+          "type": "array",
+          "maxItems": 20,
+          "items": { "type": "string", "minLength": 1, "maxLength": 280 }
+        }
+      }
+    },
+    "retry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempts", "failed_runs", "max_failed_runs", "last_failure"],
+      "properties": {
+        "attempts": { "type": "integer", "minimum": 0 },
+        "failed_runs": { "type": "integer", "minimum": 0 },
+        "max_failed_runs": { "type": "integer", "minimum": 1 },
+        "last_failure": { "type": ["object", "null"] }
+      }
+    },
+    "status_history": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["at", "status", "reason"],
+      "properties": {
+        "at": { "type": "string", "format": "date-time" },
+        "status": { "enum": ["pending", "ready", "in_progress", "failed", "completed", "blocked", "skipped"] },
+        "reason": { "type": "string", "maxLength": 280 }
+      }
+    },
+    "note": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["at", "step_id", "text"],
+      "properties": {
+        "at": { "type": "string", "format": "date-time" },
+        "step_id": { "type": ["integer", "null"], "minimum": 1 },
+        "text": { "type": "string", "minLength": 1, "maxLength": 280 }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["validation_dir", "handoff_dir"],
+      "properties": {
+        "validation_dir": { "type": "string", "minLength": 1 },
+        "handoff_dir": { "type": "string", "minLength": 1 }
+      }
+    },
+    "session_handoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["last_failure", "discarded_approaches", "next_action", "new_session_command", "new_session_task_id", "generated_at", "artifact_path"],
+      "properties": {
+        "last_failure": { "type": ["object", "null"] },
+        "discarded_approaches": { "type": "array", "maxItems": 50, "items": { "type": "string", "maxLength": 280 } },
+        "next_action": { "type": "string", "minLength": 1, "maxLength": 280 },
+        "new_session_command": { "const": "/new" },
+        "new_session_task_id": { "type": "string", "minLength": 1 },
+        "generated_at": { "type": ["string", "null"], "format": "date-time" },
+        "artifact_path": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

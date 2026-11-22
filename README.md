@@ -1,83 +1,114 @@
-# OpenCode CLI Configuration
+# OpenCode configuration
 
-Global OpenCode configuration for software-engineering work. `leader` is the default custom entry point. Built-in `plan` and `explore` remain available; built-in `build` and `general` are disabled so implementation is owned by the custom workflow.
+Global OpenCode settings, agents, commands, skills, and the artifact workflow
+used for software-engineering work.
 
 ## Agents
 
-- `leader`: routes work, enforces gates, validates handoffs, and owns the final result.
-- `analyst`: combines repository investigation, impact analysis, and implementation planning.
-- `implementer`: handles code, tests, configuration, and documentation changes within one approved scope.
-- `verifier`: runs applicable project checks and reports exact evidence without editing.
-- `reviewer`: performs final correctness, regression, maintainability, security, and dependency review.
+| Agent | Model | Role |
+| --- | --- | --- |
+| `Atlas` | `opencode-go/deepseek-v4.1-flash#max` | Default primary agent. Plans and implements work in the shared worktree. |
+| `Traveller` | `opencode-go/glm-5.3-flash#high` | Optional read-only codebase investigator. |
+| `Sentinel` | `opencode-go/gpt-6-luna#high` | Optional read-only implementation and regression reviewer. |
 
-The workflow intentionally combines closely related responsibilities:
-
-- Investigation and planning belong together in `analyst`.
-- Multi-file changes, localized fixes, and documentation changes belong together in `implementer`; the leader defines the scope guard.
-- Security review belongs with `reviewer` because it is part of final change risk assessment.
-
-## Structure
-
-```text
-.
-├── agents/
-│   ├── analyst.md
-│   ├── implementer.md
-│   ├── leader.md
-│   ├── reviewer.md
-│   └── verifier.md
-├── opencode.json
-└── LICENSE
-```
+`Traveller` and `Sentinel` deny file edits and child-agent use. Their shell use
+requires approval. `Atlas` owns mutations and task state.
 
 ## Configuration
 
-Defined in [`opencode.json`](./opencode.json):
+- [`opencode.jsonc`](./opencode.jsonc) sets `Atlas` as the default agent,
+  allows `opencode-go` and denies other providers, registers the `fff` MCP
+  server, and adds `~/.agents/skills` as a skill source.
+- [`cli.json`](./cli.json) uses the system theme, wraps diffs by word, shows
+  thinking, uses the automatic session sidebar, hides the scrollbar, and
+  enables animations. No CLI plugins are configured.
+- [`agents/`](./agents/) defines the custom agents.
+- [`commands/`](./commands/) defines `/task`, `/handoff`, and
+  `/artifact-status`.
 
-- Enabled provider: `opencode-go` only.
-- Default agent: `leader`.
-- Maximum subagent nesting depth: `1`.
-- Project instruction file: `AGENTS.md`, used when present in the opened project.
-- Built-in `plan` and `explore` remain available; built-in `build` and `general` are disabled.
-- Global and custom agent model settings use only the approved configured model families.
+The provider policy currently uses the deprecated `experimental.policies`
+location. Check the
+[OpenCode config docs](https://opencode.ai/docs/config/) before you change it.
 
-When the configured primary model or provider is unavailable, activate a fallback through OpenCode's normal model/provider override or the provider's documented operational procedure, including any required authentication. No unsupported fallback-specific configuration key is used here.
+Authenticate OpenCode Go with `opencode auth login opencode-go` or `/connect`.
+OpenCode stores provider credentials in its SQLite database. They do not go in
+`service.json`. That file is for shared-server settings. `opencode --standalone`
+can bypass the shared server for a run; it does not remove an existing
+`service.json`.
 
-## Per-project context
+### Model cost and selection
 
-OpenCode resolves `AGENTS.md` against the project being opened, not this global configuration repository. Agents use an existing project `AGENTS.md` as the project's operational source of truth. If no project `AGENTS.md` exists, suggest running the `/init` command to generate one.
+The current model choices balance role fit and usage limits:
 
-## Workflow
+- `DeepSeek V4.1 Flash` is the primary model. OpenCode Go lists the largest
+  request allowance of these three models.
+- `GLM-5.3-Flash` is a low-cost model for read-only investigation.
+- `GPT-6 Luna` has low listed token prices, but a lower Go request allowance
+  than the other two. It remains a reasonable choice for independent review,
+  where review quality matters more than maximum request volume.
 
-1. `leader` establishes the bounded Context block, classifies risk as low, normal, or high, and chooses a lightweight brief by default or a full brief for normal/high-risk or unfamiliar work.
-2. `analyst` is required for unfamiliar, broad, ambiguous, normal, or high-risk work; obvious low-risk work may skip it only with a recorded reason. It returns a concise Context delta.
-3. `implementer` performs the approved mutation within the explicit scope and returns a changed-file manifest.
-4. `verifier` runs the smallest focused applicable checks after every mutation, recording each as pass, fail, not-run, or not-applicable.
-5. `reviewer` is required for code, configuration, security, dependency, API, schema, migration, and deployment changes; documentation-only or trivial low-risk changes may skip it with a recorded reason.
-6. Mutation and verification remain serialized; independent read-only analysis may run in parallel only with disjoint questions and file sets.
-7. `leader` merges verified Context deltas and inspects final Git status and the actual diff before reporting completion. Failed, missing, or ambiguous verification blocks completion until resolved or explicitly accepted by the user.
+There is no universal best model without tests on this workload. Go limits and
+model prices can change. Check the live
+[OpenCode Go model limits](https://opencode.ai/console/go) and
+[model pricing](https://models.dev/providers/opencode-go/) before changing
+these selections.
 
-Every delegation has a `Task ID`, one owner, one acceptance criterion, explicit scope, changed-file expectations, and a next stage. Specialists use the canonical concise handoff schema; only the leader merges Context deltas, keeping the full Context block bounded.
+## Install
 
-## Permissions
-
-Permissions are defined per custom agent so the custom workflow's safety policy does not leak into OpenCode's built-in `plan` and `explore` agents. Secret-file reads are denied for every custom agent. Only `implementer` may edit files; `leader`, `analyst`, `verifier`, and `reviewer` are read-only. Bash is deny-by-default for `leader` and `analyst`, while `implementer` and `verifier` use approval-gated `*: ask` with a narrow read-only Git allowlist and `git *: deny`. `leader` may delegate to the four specialists; `analyst` and `reviewer` may not. `external_directory` is denied for all custom agents.
-
-The installed SDK's permission type formally covers `read`, `edit`, `glob`, `grep`, `list`, `bash`, `task`, `external_directory`, `todowrite`, `question`, `webfetch`, `websearch`, `lsp`, `doom_loop`, and `skill`. Runtime per-key enforcement should still be confirmed against the running OpenCode version.
-
-The leader carries a bounded Context block between stages: it retains exact file references and acceptance criteria while summarizing verified, decision-relevant findings and replacing superseded details. It does not accumulate whole files or unbounded command output.
-
-Restart OpenCode after changing this configuration because agents and configuration load at startup.
-
-## Installation
-
-Clone this repository into OpenCode's global configuration directory:
+Clone this repository into OpenCode's global config directory:
 
 ```bash
 git clone https://github.com/joaortcoelho/opencode-config.git ~/.config/opencode
 ```
 
-Restart OpenCode after changing this configuration because agents and configuration load at startup.
+Restart OpenCode after you change its config or agents.
+
+## Skills
+
+The config reads global skills from `~/.agents/skills`. Install Matt Pocock's
+skills with the
+[official skills repository](https://github.com/mattpocock/skills):
+
+```bash
+npx skills@latest add mattpocock/skills -a opencode -g
+```
+
+In the installer, select `setup-matt-pocock-skills` and any other skills you
+want. Run the setup skill once in each project. It asks where the project's
+issues, triage labels, and domain documents live. See the repository's
+[installation guide](https://github.com/mattpocock/skills#installation-30-second-setup)
+for other agents. Update the installed skills with `npx skills@latest update -g`,
+then re-run the add command to install new skills from the repository.
+
+## `fff` MCP server
+
+This config starts `fff-mcp` from
+`/home/coelho/.local/bin/fff-mcp`. Install it from the
+[official `fff` GitHub repository](https://github.com/dmtrKovalenko/fff):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/dmtrKovalenko/fff/main/install-mcp.sh | bash
+```
+
+The installer uses `~/.local/bin/fff-mcp` by default. If it installs elsewhere,
+change the command in `opencode.jsonc` to the binary's path. Review the
+[installer script](https://github.com/dmtrKovalenko/fff/blob/main/install-mcp.sh)
+before you run it if you want to inspect what it does.
+
+## Artifact workflow
+
+The artifact workflow stores task state in one JSON plan under
+`.agent/plans/`. Its Markdown view is generated; do not edit that view by hand.
+The workflow supports validation records, step dependencies, retry limits, and
+handoffs across fresh sessions.
+
+Read the
+[artifact workflow guide](./docs/artifact-driven-workflow.md) for plan commands,
+the task lifecycle, and recovery steps. Run its test suite from this directory:
+
+```bash
+artifact-workflow/tests/test.sh
+```
 
 ## License
 

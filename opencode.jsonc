@@ -1,0 +1,27 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "Atlas",
+  "experimental": {
+    "policies": [
+      {
+        "action": "provider.use",
+        "resource": "*",
+        "effect": "deny",
+      },
+      {
+        "action": "provider.use",
+        "resource": "opencode-go",
+        "effect": "allow",
+      },
+    ],
+  },
+  "mcp": {
+    "servers": {
+      "fff": {
+        "type": "local",
+        "command": ["/home/coelho/.local/bin/fff-mcp"],
+      },
+    },
+  },
+  "skills": ["~/.agents/skills"],
+}

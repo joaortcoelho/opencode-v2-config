@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opencode.local/artifact-workflow/schema/v2/status-transition.schema.json",
+  "title": "Artifact workflow status transition (v2)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["from", "to", "at", "reason"],
+  "properties": {
+    "from": { "enum": ["pending", "ready", "in_progress", "failed", "completed", "blocked", "skipped"] },
+    "to": { "enum": ["pending", "ready", "in_progress", "failed", "completed", "blocked", "skipped"] },
+    "at": { "type": "string", "format": "date-time" },
+    "reason": { "type": "string", "maxLength": 280 }
+  }
+}

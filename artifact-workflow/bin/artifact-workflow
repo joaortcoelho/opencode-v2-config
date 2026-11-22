@@ -1,0 +1,1323 @@
+#!/usr/bin/env python3
+"""Durable JSON-plan workflow for OpenCode.
+
+The JSON plan is the only mutable state source.  Markdown, validation reports,
+and handoff prompts are generated views.  jq is used at every plan boundary to
+parse, query, canonicalise, and perform basic structural checks.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import datetime as dt
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Callable, Iterator, Sequence
+
+
+TOOLKIT_ROOT = Path(__file__).resolve().parents[1]
+SCHEMA_VERSION = 2
+SCHEMA_PATH = TOOLKIT_ROOT / "schema" / f"v{SCHEMA_VERSION}" / "plan.schema.json"
+TASK_ID_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}-[a-z0-9]+(?:-[a-z0-9]+)*$")
+CRITERION_PATTERN = re.compile(r"^AC-[0-9]+$")
+STATUSES = {"pending", "ready", "in_progress", "failed", "completed", "blocked", "skipped"}
+VALIDATION_STATUSES = {"passed", "failed", "blocked"}
+TASK_PHASES = {"ready", "working", "blocked", "completed"}
+RISK_LEVELS = {"low", "med", "high"}
+SPEC_FIELDS = ("invariants", "non_goals", "edge_cases", "regression_risks")
+
+
+class WorkflowError(RuntimeError):
+    """Expected user-facing workflow error."""
+
+
+def fail(message: str) -> None:
+    raise WorkflowError(message)
+
+
+def now() -> str:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def compact_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+
+def path_from(value: str) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else Path.cwd() / path
+
+
+def workspace_for(plan: dict[str, object]) -> Path:
+    task = object_value(plan.get("task"), "task")
+    workspace = string_value(task.get("workspace"), "task.workspace")
+    return path_from(workspace)
+
+
+def object_value(value: object, name: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        fail(f"{name} must be an object")
+    return value
+
+
+def list_value(value: object, name: str) -> list[object]:
+    if not isinstance(value, list):
+        fail(f"{name} must be an array")
+    return value
+
+
+def string_value(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value:
+        fail(f"{name} must be a non-empty string")
+    return value
+
+
+def integer_value(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        fail(f"{name} must be an integer")
+    return value
+
+
+def run_jq(arguments: Sequence[str], *, input_text: str | None = None) -> str:
+    command = ["jq", *arguments]
+    try:
+        result = subprocess.run(
+            command,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError as error:
+        fail(f"jq is required: {error}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        fail(f"jq failed: {detail}")
+    return result.stdout
+
+
+def load_plan(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        fail(f"plan not found: {path}")
+    text = run_jq(["-c", ".", str(path)])
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as error:
+        fail(f"jq returned invalid JSON: {error}")
+    return object_value(value, "plan")
+
+
+def bounded(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "\n[bounded]"
+
+
+def validation_report_path(path: Path, operation: str, plan: dict[str, object] | None = None) -> Path:
+    source = plan if plan is not None else {}
+    try:
+        workspace = workspace_for(source)
+    except WorkflowError:
+        workspace = path.parent.parent.parent if len(path.parents) >= 3 else Path.cwd()
+    task_id = "invalid-plan"
+    try:
+        task = object_value(source.get("task"), "task")
+        task_id = str(task.get("id", task_id))
+    except WorkflowError:
+        pass
+    directory = workspace / ".agent" / "validation" / task_id
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{operation}-{compact_now()}-{os.getpid()}.log"
+
+
+def path_for_plan(plan: dict[str, object], path: Path) -> str:
+    workspace = workspace_for(plan)
+    try:
+        return str(path.relative_to(workspace))
+    except ValueError:
+        return str(path)
+
+
+def check_jq_shape(path: Path) -> None:
+    filters = [
+        (f'type == "object" and .schema_version == {SCHEMA_VERSION} and (.["$schema"] | type == "string")', "plan must be an object with a $schema string"),
+        ('.task | type == "object" and (.id | type == "string") and (.slug | type == "string") and (.title | type == "string")', "task must be an object with string id, slug, and title"),
+        ('.criteria | type == "array"', "criteria must be an array"),
+        ('.execution.steps | type == "array" and length > 0', "execution.steps must be a non-empty array"),
+        ('[.execution.steps[].id] as $ids | ($ids | unique | length) == ($ids | length)', "step IDs must be unique"),
+        ('[.execution.steps[].id] as $ids | ($ids | sort) == $ids', "steps must be ordered by ID"),
+        ('[.criteria[].id] as $ids | ($ids | unique | length) == ($ids | length)', "criterion IDs must be unique"),
+    ]
+    for expression, message in filters:
+        try:
+            run_jq(["-e", expression, str(path)])
+        except WorkflowError:
+            fail(f"structure check failed: {message}")
+
+
+def allowed_transition(source: str, target: str) -> bool:
+    return (
+        source == target
+        or (source == "pending" and target in {"ready", "in_progress", "blocked", "skipped"})
+        or (source == "ready" and target in {"in_progress", "blocked", "skipped"})
+        or (source == "in_progress" and target in {"failed", "completed", "blocked", "skipped"})
+        or (source == "failed" and target in {"in_progress", "blocked"})
+        or (source == "blocked" and target == "blocked")
+        or (source == "completed" and target == "completed")
+        or (source == "skipped" and target == "skipped")
+    )
+
+
+def derive_execution(steps: list[dict[str, object]]) -> tuple[str, object]:
+    """Return the (phase, current_step_id) pair for a step list.
+
+    One rule for both the writer (refresh) and the validator (validate_data).
+    An in_progress step outranks an earlier pending step, so out-of-order work
+    shows the step that is actually being worked on.
+    """
+
+    def retry_exhausted(step: dict[str, object]) -> bool:
+        retry = step.get("retry")
+        return (
+            isinstance(retry, dict)
+            and step.get("status") == "failed"
+            and retry.get("failed_runs") == retry.get("max_failed_runs")
+            and retry.get("max_failed_runs") is not None
+        )
+
+    if steps and all(step.get("status") in {"completed", "skipped"} for step in steps):
+        phase = "completed"
+    elif any(step.get("status") == "blocked" or retry_exhausted(step) for step in steps):
+        phase = "blocked"
+    elif any(step.get("status") == "in_progress" for step in steps):
+        phase = "working"
+    else:
+        phase = "ready"
+    active = next((step for step in steps if step.get("status") == "in_progress"), None)
+    if active is None:
+        active = next((step for step in steps if step.get("status") not in {"completed", "skipped"}), None)
+    return phase, active.get("id") if active is not None else None
+
+
+def validate_data(plan: dict[str, object]) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(plan.get("$schema"), str) or not plan.get("$schema"):
+        errors.append("$schema must be a non-empty string")
+    version = plan.get("schema_version")
+    if version != SCHEMA_VERSION:
+        errors.append(
+            f"schema_version must be {SCHEMA_VERSION} (found {version!r}); run 'migrate' to upgrade an older plan"
+        )
+
+    task = plan.get("task")
+    if not isinstance(task, dict):
+        errors.append("task must be an object")
+        task = {}
+    for field in ("id", "slug", "title", "created_at", "updated_at", "workspace"):
+        if not isinstance(task.get(field), str) or not task[field]:
+            errors.append(f"task.{field} must be a non-empty string")
+    task_id = task.get("id")
+    if isinstance(task_id, str) and not TASK_ID_PATTERN.fullmatch(task_id):
+        errors.append("task.id must use timestamp-plus-slug format")
+
+    for field in ("objective", "criteria", "constraints", "decisions", "guardrails", "execution", "session_handoff", "artifacts", "notes"):
+        if field not in plan:
+            errors.append(f"missing required field: {field}")
+    if not isinstance(plan.get("objective"), str) or not plan.get("objective"):
+        errors.append("objective must be a non-empty string")
+    for field in ("constraints", "decisions", "notes"):
+        value = plan.get(field)
+        if not isinstance(value, list):
+            errors.append(f"{field} must be an array")
+        elif field != "notes" and any(not isinstance(item, str) for item in value):
+            errors.append(f"{field} must contain strings")
+
+    criteria = plan.get("criteria")
+    criterion_ids: list[str] = []
+    if not isinstance(criteria, list):
+        errors.append("criteria must be an array")
+        criteria = []
+    for index, criterion in enumerate(criteria):
+        label = f"criterion {index + 1}"
+        if not isinstance(criterion, dict):
+            errors.append(f"{label} must be an object")
+            continue
+        identifier = criterion.get("id")
+        if not isinstance(identifier, str) or not CRITERION_PATTERN.fullmatch(identifier):
+            errors.append(f"{label} id must match AC-<n>")
+            continue
+        criterion_ids.append(identifier)
+        label = identifier
+        if criterion.get("status") not in {"active", "superseded"}:
+            errors.append(f"{label} status must be active or superseded")
+        statement = criterion.get("statement")
+        if not isinstance(statement, str) or not statement or len(statement) > 280:
+            errors.append(f"{label} statement must be 1-280 characters")
+    if len(criterion_ids) != len(set(criterion_ids)):
+        errors.append("criterion IDs must be unique")
+    expected_criteria = [f"AC-{number}" for number in range(1, len(criterion_ids) + 1)]
+    if sorted(criterion_ids, key=lambda value: int(value[3:])) != expected_criteria:
+        errors.append("criterion IDs must start at AC-1 and be contiguous; superseded criteria stay in the list")
+    known_criteria = set(criterion_ids)
+
+    guardrails = plan.get("guardrails")
+    if not isinstance(guardrails, dict):
+        errors.append("guardrails must be an object")
+        guardrails = {}
+    retry_cap = guardrails.get("max_failed_validation_runs_per_step")
+    if isinstance(retry_cap, bool) or not isinstance(retry_cap, int) or retry_cap < 1:
+        errors.append("guardrails retry cap must be a positive integer")
+        retry_cap = 3
+    if guardrails.get("context_reset_action") != "stop_at_safe_boundary_and_request_explicit_new_session":
+        errors.append("guardrails.context_reset_action is invalid")
+    if guardrails.get("context_reset_threshold") != 0.5:
+        errors.append("guardrails.context_reset_threshold must be 0.5")
+    if guardrails.get("max_consecutive_read_only_turns") != 6:
+        errors.append("guardrails.max_consecutive_read_only_turns must be 6")
+    if guardrails.get("terminal_task_states") != ["completed", "blocked"]:
+        errors.append("guardrails.terminal_task_states is invalid")
+    if guardrails.get("single_writer") is not True:
+        errors.append("guardrails.single_writer must be true")
+    if guardrails.get("allow_unrequested_commits") is not False:
+        errors.append("guardrails.allow_unrequested_commits must be false")
+    if guardrails.get("allow_unrequested_pushes") is not False:
+        errors.append("guardrails.allow_unrequested_pushes must be false")
+    if guardrails.get("validation_command_policy") != "approval_or_allowlist":
+        errors.append("guardrails.validation_command_policy is invalid")
+
+    execution = plan.get("execution")
+    if not isinstance(execution, dict):
+        errors.append("execution must be an object")
+        execution = {}
+    phase = execution.get("phase")
+    if phase not in TASK_PHASES:
+        errors.append("execution.phase is invalid")
+    raw_steps = execution.get("steps")
+    if not isinstance(raw_steps, list) or not raw_steps:
+        errors.append("execution.steps must contain at least one step")
+        raw_steps = []
+
+    steps: list[dict[str, object]] = []
+    for index, raw_step in enumerate(raw_steps):
+        if not isinstance(raw_step, dict):
+            errors.append(f"step {index + 1} must be an object")
+            continue
+        steps.append(raw_step)
+        step_id = raw_step.get("id")
+        if isinstance(step_id, bool) or not isinstance(step_id, int) or step_id < 1:
+            errors.append(f"step {index + 1} ID must be a positive integer")
+        if not isinstance(raw_step.get("title"), str) or not raw_step.get("title"):
+            errors.append(f"step {index + 1} title must be non-empty")
+        if raw_step.get("status") not in STATUSES:
+            errors.append(f"step {index + 1} status is invalid")
+        if raw_step.get("risk") not in RISK_LEVELS:
+            errors.append(f"step {index + 1} risk must be low, med, or high")
+        for field in ("depends_on", "satisfies", "changes", "validation", "notes", "validation_records", "status_history", *SPEC_FIELDS):
+            if not isinstance(raw_step.get(field), list):
+                errors.append(f"step {index + 1} {field} must be an array")
+        for field in ("changes", "validation", "notes", *SPEC_FIELDS):
+            value = raw_step.get(field)
+            if isinstance(value, list):
+                if any(not isinstance(item, str) or not item or len(item) > 280 for item in value):
+                    errors.append(f"step {index + 1} {field} must contain 1-280 character strings")
+                if len(value) > 20 and field in SPEC_FIELDS:
+                    errors.append(f"step {index + 1} {field} must hold at most 20 entries")
+        if raw_step.get("risk") == "high":
+            invariants = raw_step.get("invariants")
+            if not isinstance(invariants, list) or not invariants:
+                errors.append(f"step {index + 1} is high risk and must declare at least one invariant")
+        retry = raw_step.get("retry")
+        if not isinstance(retry, dict):
+            errors.append(f"step {index + 1} retry must be an object")
+            continue
+        for field in ("attempts", "failed_runs", "max_failed_runs"):
+            value = retry.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                errors.append(f"step {index + 1} retry.{field} must be a non-negative integer")
+        if retry.get("max_failed_runs") != retry_cap:
+            errors.append(f"step {index + 1} retry cap must match guardrails")
+
+    ids = [step.get("id") for step in steps]
+    integer_ids = [value for value in ids if isinstance(value, int) and not isinstance(value, bool)]
+    if len(integer_ids) != len(set(integer_ids)):
+        errors.append("step IDs must be unique")
+    if integer_ids != sorted(integer_ids):
+        errors.append("steps must be ordered by ID")
+    if integer_ids != list(range(1, len(integer_ids) + 1)):
+        errors.append("step IDs must start at 1 and be contiguous")
+    known_ids = set(integer_ids)
+
+    for step in steps:
+        step_id = step.get("id")
+        dependencies = step.get("depends_on")
+        if isinstance(dependencies, list):
+            for dependency in dependencies:
+                if not isinstance(dependency, int) or dependency not in known_ids:
+                    errors.append(f"step {step_id} has an unknown dependency")
+                elif isinstance(step_id, int) and dependency >= step_id:
+                    errors.append(f"step {step_id} depends on a later step")
+        records = step.get("validation_records")
+        history = step.get("status_history")
+        retry = step.get("retry")
+        satisfies = step.get("satisfies")
+        if isinstance(satisfies, list):
+            if len(satisfies) != len(set(str(value) for value in satisfies)):
+                errors.append(f"step {step_id} satisfies must not repeat a criterion")
+            for reference in satisfies:
+                if not isinstance(reference, str) or reference not in known_criteria:
+                    errors.append(f"step {step_id} satisfies an unknown criterion: {reference}")
+        if isinstance(records, list):
+            for record in records:
+                if not isinstance(record, dict):
+                    errors.append(f"step {step_id} has an invalid validation record")
+                    continue
+                if record.get("status") not in VALIDATION_STATUSES:
+                    errors.append(f"step {step_id} has an invalid validation status")
+                summary = record.get("summary")
+                if not isinstance(summary, str) or not summary or len(summary) > 280:
+                    errors.append(f"step {step_id} validation summary must be 1-280 characters")
+                if not isinstance(record.get("command"), str) or not record.get("command"):
+                    errors.append(f"step {step_id} validation command is required")
+                unverified = record.get("unverified")
+                if not isinstance(unverified, list):
+                    errors.append(f"step {step_id} validation record must declare unverified (use [] for none)")
+                elif len(unverified) > 20:
+                    errors.append(f"step {step_id} unverified must hold at most 20 entries")
+                elif any(not isinstance(item, str) or not item or len(item) > 280 for item in unverified):
+                    errors.append(f"step {step_id} unverified must contain 1-280 character strings")
+        if isinstance(history, list):
+            if not history:
+                errors.append(f"step {step_id} status history must not be empty")
+            for item in history:
+                if not isinstance(item, dict) or item.get("status") not in STATUSES:
+                    errors.append(f"step {step_id} has an invalid status history record")
+                elif len(str(item.get("reason", ""))) > 280:
+                    errors.append(f"step {step_id} status reason is too long")
+            if history and history[-1].get("status") != step.get("status"):
+                errors.append(f"step {step_id} status history does not end at current status")
+            for before, after in zip(history, history[1:]):
+                if isinstance(before, dict) and isinstance(after, dict) and not allowed_transition(str(before.get("status")), str(after.get("status"))):
+                    errors.append(f"step {step_id} has an illegal status transition")
+        if isinstance(retry, dict) and isinstance(records, list):
+            attempts = retry.get("attempts")
+            failed_runs = retry.get("failed_runs")
+            if attempts != len(records):
+                errors.append(f"step {step_id} retry.attempts must equal validation record count")
+            if isinstance(failed_runs, int):
+                actual_failed = sum(1 for record in records if isinstance(record, dict) and record.get("status") == "failed")
+                if failed_runs != actual_failed or failed_runs > retry_cap:
+                    errors.append(f"step {step_id} retry.failed_runs is invalid")
+        status = step.get("status")
+        record_statuses = {record.get("status") for record in records if isinstance(record, dict)} if isinstance(records, list) else set()
+        if status == "completed" and "passed" not in record_statuses:
+            errors.append(f"step {step_id} completed without passed validation")
+        if status == "failed" and "failed" not in record_statuses:
+            errors.append(f"step {step_id} failed without failed validation")
+        if status == "blocked" and "blocked" not in record_statuses and not (isinstance(retry, dict) and retry.get("failed_runs") == retry_cap):
+            errors.append(f"step {step_id} blocked without blocker or retry exhaustion")
+        if status in {"in_progress", "completed", "failed"} and isinstance(dependencies, list):
+            for dependency in dependencies:
+                dependency_step = next((candidate for candidate in steps if candidate.get("id") == dependency), None)
+                if dependency_step is None or dependency_step.get("status") not in {"completed", "skipped"}:
+                    errors.append(f"step {step_id} has an active incomplete dependency")
+
+    expected_phase, expected_current = derive_execution([step for step in steps if isinstance(step, dict)])
+    if phase != expected_phase:
+        errors.append("execution.phase is not derived from step statuses")
+    if execution.get("current_step") != expected_current:
+        errors.append("execution.current_step is not derived from step statuses")
+
+    handoff = plan.get("session_handoff")
+    if not isinstance(handoff, dict):
+        errors.append("session_handoff must be an object")
+    else:
+        if handoff.get("new_session_command") != "/new":
+            errors.append("session_handoff.new_session_command must be /new")
+        if handoff.get("new_session_task_id") != task_id:
+            errors.append("session_handoff task ID must match task.id")
+        if not isinstance(handoff.get("discarded_approaches"), list):
+            errors.append("session_handoff.discarded_approaches must be an array")
+        if not isinstance(handoff.get("next_action"), str) or len(handoff["next_action"]) > 280:
+            errors.append("session_handoff.next_action must be bounded")
+
+    notes = plan.get("notes")
+    if isinstance(notes, list):
+        for note in notes:
+            if not isinstance(note, dict) or not isinstance(note.get("text"), str) or len(note["text"]) > 280:
+                errors.append("notes must contain bounded text records")
+    return errors
+
+
+def validate_file(path: Path, report: Path) -> None:
+    report.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = [f"file: {path}", f"schema: {SCHEMA_PATH}"]
+    try:
+        plan = load_plan(path)
+        version = plan.get("schema_version")
+        if version != SCHEMA_VERSION:
+            fail(
+                f"schema_version must be {SCHEMA_VERSION} (found {version!r}); "
+                f"run 'artifact-workflow migrate {path}' to upgrade"
+            )
+        check_jq_shape(path)
+        errors = validate_data(plan)
+    except WorkflowError as error:
+        errors = [str(error)]
+    if errors:
+        lines.extend(f"error: {error}" for error in errors)
+        report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        fail(f"validation failed; full report: {report}")
+    lines.append("status: passed")
+    report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def clean_text(value: object) -> str:
+    return str(value).replace("\r", " ").replace("\n", " ").replace("|", "\\|")
+
+
+def render_content(plan: dict[str, object]) -> str:
+    task = object_value(plan["task"], "task")
+    execution = object_value(plan["execution"], "execution")
+    handoff = object_value(plan["session_handoff"], "session_handoff")
+    steps = list_value(execution["steps"], "execution.steps")
+    lines = [
+        f"# {clean_text(task['title'])}",
+        "",
+        f"**Task ID:** `{clean_text(task['id'])}`  ",
+        f"**Phase:** `{clean_text(execution['phase'])}`  ",
+        f"**Current step:** {execution.get('current_step') or 'none'}  ",
+        f"**Workspace:** `{clean_text(task['workspace'])}`",
+        "",
+        "## Objective",
+        "",
+        str(plan["objective"]),
+        "",
+        "## Decisions",
+        "",
+    ]
+    decisions = list_value(plan.get("decisions"), "decisions")
+    lines.extend([f"- {item}" for item in decisions] or ["- None recorded."])
+    lines.extend(["", "## Acceptance criteria", ""])
+    criteria = list_value(plan.get("criteria"), "criteria")
+    if criteria:
+        for raw_criterion in criteria:
+            criterion = object_value(raw_criterion, "criterion")
+            marker = " (superseded)" if criterion.get("status") == "superseded" else ""
+            lines.append(f"- `{criterion['id']}` — {criterion['statement']}{marker}")
+    else:
+        lines.append("- None minted. Low-risk task; prose criteria apply.")
+    lines.extend(["", "## Constraints", ""])
+    constraints = list_value(plan.get("constraints"), "constraints")
+    lines.extend([f"- {item}" for item in constraints] or ["- None recorded."])
+    lines.extend(["", "## Steps", "", "| ID | Status | Risk | Title | Depends on | Satisfies |", "| --- | --- | --- | --- | --- | --- |"])
+    for raw_step in steps:
+        step = object_value(raw_step, "step")
+        depends = ", ".join(str(value) for value in list_value(step["depends_on"], "depends_on")) or "—"
+        satisfies = ", ".join(str(value) for value in list_value(step.get("satisfies"), "satisfies")) or "—"
+        lines.append(f"| {step['id']} | {clean_text(step['status'])} | {clean_text(step['risk'])} | {clean_text(step['title'])} | {depends} | {satisfies} |")
+    lines.extend(["", "## Validation", ""])
+    records_found = False
+    for raw_step in steps:
+        step = object_value(raw_step, "step")
+        for raw_record in list_value(step["validation_records"], "validation_records"):
+            record = object_value(raw_record, "validation record")
+            records_found = True
+            lines.append(f"- Step {step['id']}, `{record['status']}`, {record['at']}: {clean_text(record['summary'])}")
+            unverified = list_value(record.get("unverified"), "unverified")
+            if unverified:
+                lines.append(f"  - Unverified: {'; '.join(clean_text(item) for item in unverified)}")
+    if not records_found:
+        lines.append("- No validation records.")
+    lines.extend(
+        [
+            "",
+            "## Handoff",
+            "",
+            f"- Next action: {clean_text(handoff['next_action'])}",
+            f"- New session: `{handoff['new_session_command']}`",
+            f"- Handoff artifact: {handoff.get('artifact_path') or '—'}",
+            f"- Last failure: {clean_text(object_value(handoff['last_failure'], 'last_failure')['summary']) if isinstance(handoff.get('last_failure'), dict) else 'None.'}",
+            "",
+            "_Generated from the JSON plan. Do not edit this file._",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def atomic_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
+        temp = Path(handle.name)
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
+@contextlib.contextmanager
+def plan_lock(path: Path) -> Iterator[None]:
+    lock_path = Path(f"{path}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        except OSError as error:
+            fail(f"cannot lock plan: {error}")
+        handle.seek(0)
+        handle.truncate()
+        handle.write(f"pid {os.getpid()}\n{int(dt.datetime.now().timestamp())} {now()}\nplan {path}\n")
+        handle.flush()
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def write_plan(path: Path, plan: dict[str, object], operation: str, report: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    canonical_text = run_jq(["-c", "."], input_text=json.dumps(plan, ensure_ascii=False))
+    canonical_value = json.loads(canonical_text)
+    canonical_plan = object_value(canonical_value, "plan")
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
+        temp = Path(handle.name)
+        json.dump(canonical_plan, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    try:
+        run_jq(["-e", ".", str(temp)])
+        try:
+            validate_file(temp, report)
+        except WorkflowError as error:
+            detail = bounded(report.read_text(encoding="utf-8"), 1200) if report.is_file() else ""
+            raise WorkflowError(f"{error}\n{detail}".rstrip()) from error
+        if os.environ.get("ARTIFACT_WORKFLOW_FAIL_BEFORE_REPLACE") == "1":
+            raise WorkflowError("test hook stopped update before replace")
+        hold = os.environ.get("ARTIFACT_WORKFLOW_LOCK_HOLD_SECONDS", "0")
+        if hold != "0":
+            import time
+
+            time.sleep(float(hold))
+        os.replace(temp, path)
+    except Exception:
+        temp.unlink(missing_ok=True)
+        raise
+    atomic_text(path.with_suffix(".md"), render_content(canonical_plan))
+    print(f"{operation}: {path}")
+
+
+def mutate(path: Path, operation: str, mutation: Callable[[dict[str, object]], dict[str, object]], *, allow_invalid: bool = False) -> None:
+    report: Path
+    with plan_lock(path):
+        plan = load_plan(path)
+        if not allow_invalid:
+            existing_report = validation_report_path(path, f"{operation}-input", plan)
+            try:
+                validate_file(path, existing_report)
+            except WorkflowError as error:
+                fail(f"cannot update invalid plan: {error}")
+        candidate = mutation(plan)
+        report = validation_report_path(path, operation, candidate)
+        write_plan(path, candidate, operation, report)
+
+
+def refresh(plan: dict[str, object]) -> None:
+    execution = object_value(plan["execution"], "execution")
+    steps = list_value(execution["steps"], "execution.steps")
+    typed_steps = [object_value(step, "step") for step in steps]
+    phase, current_step = derive_execution(typed_steps)
+    execution["phase"] = phase
+    execution["current_step"] = current_step
+    handoff = object_value(plan["session_handoff"], "session_handoff")
+    if phase == "completed":
+        handoff["next_action"] = "Task complete."
+    elif phase == "blocked":
+        handoff["next_action"] = f"Resolve the blocker at step {current_step if current_step is not None else '?'}."
+    else:
+        title = next((str(step.get("title", "")) for step in typed_steps if step.get("id") == current_step), "")
+        handoff["next_action"] = f"Continue step {current_step if current_step is not None else '?' }: {title}"
+
+
+def command_init(args: argparse.Namespace) -> None:
+    title = string_value(args.title, "--title")
+    slug = re.sub(r"[^a-z0-9]+", "-", (args.slug or title).lower()).strip("-")
+    if not slug:
+        fail("slug must contain letters or numbers")
+    task_id = args.task_id or f"{compact_now()}-{slug}"
+    if not TASK_ID_PATTERN.fullmatch(task_id):
+        fail(f"invalid task ID: {task_id}")
+    workspace = path_from(args.workspace or str(Path.cwd()))
+    plan_path = path_from(args.plan) if args.plan else workspace / ".agent" / "plans" / f"{task_id}.json"
+    if plan_path.exists():
+        fail(f"plan already exists: {plan_path}")
+    timestamp = now()
+    raw_steps = args.step or ["1|Implement the task"]
+    criteria: list[dict[str, object]] = []
+    for index, statement in enumerate(args.criterion or [], start=1):
+        criteria.append({"id": f"AC-{index}", "statement": string_value(statement, "criterion"), "status": "active"})
+    steps: list[dict[str, object]] = []
+    for raw in raw_steps:
+        if "|" not in raw:
+            fail(f"step must use ID|TITLE: {raw}")
+        raw_id, step_title = raw.split("|", 1)
+        try:
+            step_id = int(raw_id)
+        except ValueError:
+            fail(f"invalid step ID: {raw_id}")
+        dependencies: list[int] = []
+        for dependency in args.depends_on or []:
+            dependency_id, separator, dependency_list = dependency.partition("|")
+            if separator and dependency_id == raw_id and dependency_list:
+                dependencies = [int(value) for value in dependency_list.split(",") if value]
+        risk = "low"
+        satisfies: list[str] = []
+        spec: dict[str, list[str]] = {field: [] for field in SPEC_FIELDS}
+        for entry in args.step_meta or []:
+            meta_id, separator, payload = entry.partition("|")
+            if not separator or meta_id != raw_id:
+                continue
+            key, _, value = payload.partition("=")
+            if key == "risk":
+                risk = value
+            elif key == "satisfies":
+                satisfies = [item for item in value.split(",") if item]
+            elif key in SPEC_FIELDS:
+                spec[key].append(value)
+        if risk not in RISK_LEVELS:
+            fail(f"step {raw_id} risk must be low, med, or high: {risk}")
+        steps.append(
+            {
+                "id": step_id,
+                "title": string_value(step_title, "step title"),
+                "status": "pending",
+                "risk": risk,
+                "depends_on": dependencies,
+                "satisfies": satisfies,
+                "invariants": spec["invariants"],
+                "non_goals": spec["non_goals"],
+                "edge_cases": spec["edge_cases"],
+                "regression_risks": spec["regression_risks"],
+                "changes": [],
+                "validation": ["Run the relevant validation command."],
+                "validation_records": [],
+                "retry": {"attempts": 0, "failed_runs": 0, "max_failed_runs": 3, "last_failure": None},
+                "status_history": [{"at": timestamp, "status": "pending", "reason": "Step created."}],
+                "notes": [],
+            }
+        )
+    steps.sort(key=lambda step: int(step["id"]))
+    plan: dict[str, object] = {
+        "$schema": f"artifact-workflow/schema/v{SCHEMA_VERSION}/plan.schema.json",
+        "schema_version": SCHEMA_VERSION,
+        "task": {
+            "id": task_id,
+            "slug": slug,
+            "title": title,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "workspace": str(workspace),
+            "base_revision": args.base_revision,
+            "branch": args.branch,
+        },
+        "objective": args.objective or title,
+        "criteria": criteria,
+        "constraints": args.constraint or [],
+        "decisions": args.decision or [],
+        "guardrails": {
+            "context_reset_threshold": 0.5,
+            "context_reset_action": "stop_at_safe_boundary_and_request_explicit_new_session",
+            "max_failed_validation_runs_per_step": 3,
+            "max_consecutive_read_only_turns": 6,
+            "terminal_task_states": ["completed", "blocked"],
+            "single_writer": True,
+            "allow_unrequested_commits": False,
+            "allow_unrequested_pushes": False,
+            "validation_command_policy": "approval_or_allowlist",
+        },
+        "execution": {"phase": "ready", "current_step": 1, "steps": steps},
+        "notes": [],
+        "artifacts": {"validation_dir": f".agent/validation/{task_id}", "handoff_dir": ".agent/handoffs"},
+        "session_handoff": {
+            "last_failure": None,
+            "discarded_approaches": [],
+            "next_action": "Continue step 1.",
+            "new_session_command": "/new",
+            "new_session_task_id": task_id,
+            "generated_at": None,
+            "artifact_path": None,
+        },
+    }
+    refresh(plan)
+    with plan_lock(plan_path):
+        if plan_path.exists():
+            fail(f"plan already exists: {plan_path}")
+        report = validation_report_path(plan_path, "init", plan)
+        write_plan(plan_path, plan, "created", report)
+
+
+def command_validate(args: argparse.Namespace) -> None:
+    path = resolve_plan(args.plan)
+    plan: dict[str, object] | None = None
+    if not args.report:
+        try:
+            plan = load_plan(path)
+        except WorkflowError:
+            plan = None
+    report = path_from(args.report) if args.report else validation_report_path(path, "validate", plan)
+    try:
+        validate_file(path, report)
+    except WorkflowError as error:
+        print(str(error), file=sys.stderr)
+        print(bounded(report.read_text(encoding="utf-8"), 4000), file=sys.stderr, end="")
+        raise
+    print(f"valid: {path}\nreport: {report}")
+
+
+def resolve_plan(reference: str) -> Path:
+    path = path_from(reference)
+    if path.is_file():
+        return path
+    candidates = [Path.cwd() / ".agent" / "plans" / reference, Path.cwd() / ".agent" / "plans" / f"{reference}.json"]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    fail(f"plan not found: {reference}")
+
+
+def command_render(args: argparse.Namespace) -> None:
+    path = resolve_plan(args.plan)
+    plan = load_plan(path)
+    output = path_from(args.output) if args.output else path.with_suffix(".md")
+    atomic_text(output, render_content(plan))
+    print(f"rendered: {output}")
+
+
+def command_state(args: argparse.Namespace) -> None:
+    path = resolve_plan(args.plan)
+    # Use jq for state queries. The compact JSON is stable and easy for agents to consume.
+    expression = '{task_id: .task.id, title: .task.title, phase: .execution.phase, current_step: .execution.current_step, next_action: .session_handoff.next_action, steps: [.execution.steps[] | {id, title, status, attempts: .retry.attempts, failed_runs: .retry.failed_runs, max_failed_runs: .retry.max_failed_runs}]}'
+    if args.json:
+        print(run_jq(["-c", expression, str(path)]), end="")
+    else:
+        data = json.loads(run_jq(["-c", expression, str(path)]))
+        print(f"Task: {data['task_id']}\nPhase: {data['phase']}\nCurrent step: {data['current_step'] or 'none'}\nNext action: {data['next_action']}\n")
+        for step in data["steps"]:
+            print(f"{step['id']}  {step['status']}  {step['title']}")
+
+
+def command_mark(args: argparse.Namespace) -> None:
+    path = resolve_plan(args.plan)
+    target = args.status
+    if target not in STATUSES:
+        fail(f"invalid status: {target}")
+    result = args.result or target
+    if target == "completed" and result != "passed":
+        fail("completed requires --result passed")
+    if target == "failed" and result != "failed":
+        fail("failed requires a failed validation result")
+    if target == "blocked" and result != "blocked":
+        fail("blocked requires a blocked validation result")
+    if target in {"completed", "failed", "blocked"}:
+        if not args.command or not args.summary:
+            fail("validation result requires --command and --summary")
+        if len(args.summary) > 280:
+            fail("summary must be 280 characters or less")
+    if target == "skipped" and not args.reason:
+        fail("skipped requires --reason")
+    def update(plan: dict[str, object]) -> dict[str, object]:
+        timestamp = now()
+        record_id = f"v{compact_now()}-{os.getpid()}-{args.step}"
+        execution = object_value(plan["execution"], "execution")
+        steps = [object_value(step, "step") for step in list_value(execution["steps"], "execution.steps")]
+        step = next((candidate for candidate in steps if candidate.get("id") == args.step), None)
+        if step is None:
+            fail(f"step does not exist: {args.step}")
+        source = string_value(step.get("status"), "step.status")
+        if not allowed_transition(source, target):
+            fail(f"illegal status transition: {source} -> {target}")
+        dependencies = [integer_value(value, "dependency") for value in list_value(step.get("depends_on"), "step.depends_on")]
+        if target == "in_progress":
+            for dependency in dependencies:
+                dependency_step = next(candidate for candidate in steps if candidate.get("id") == dependency)
+                if dependency_step.get("status") not in {"completed", "skipped"}:
+                    fail("step dependencies are not complete")
+        failed_runs = integer_value(object_value(step["retry"], "retry")["failed_runs"], "retry.failed_runs")
+        retry_cap = integer_value(object_value(step["retry"], "retry")["max_failed_runs"], "retry.max_failed_runs")
+        new_failed_runs = failed_runs + (1 if result == "failed" else 0)
+        new_status = "blocked" if target == "failed" and new_failed_runs >= retry_cap else target
+        step["status"] = new_status
+        history = list_value(step["status_history"], "status_history")
+        history.append({"at": timestamp, "status": new_status, "reason": args.reason or ("Validation retry cap reached." if new_status == "blocked" and target == "failed" else f"Marked {new_status}.")})
+        if target in {"completed", "failed", "blocked"}:
+            records = list_value(step["validation_records"], "validation_records")
+            unverified = [item for item in (args.unverified or []) if item]
+            if any(len(item) > 280 for item in unverified):
+                fail("each unverified entry must be 280 characters or less")
+            if len(unverified) > 20:
+                fail("unverified must hold at most 20 entries")
+            records.append(
+                {
+                    "id": record_id,
+                    "at": timestamp,
+                    "command": args.command,
+                    "status": result,
+                    "summary": args.summary,
+                    "output_path": args.output,
+                    "unverified": unverified,
+                }
+            )
+            retry = object_value(step["retry"], "retry")
+            retry["attempts"] = integer_value(retry["attempts"], "retry.attempts") + 1
+            retry["failed_runs"] = new_failed_runs
+            if result in {"failed", "blocked"}:
+                failure = {"at": timestamp, "step_id": args.step, "status": result, "summary": args.summary, "output_path": args.output, "retry_count": new_failed_runs}
+                retry["last_failure"] = failure
+                handoff = object_value(plan["session_handoff"], "session_handoff")
+                handoff["last_failure"] = failure
+        plan["task"] = object_value(plan["task"], "task")
+        plan["task"]["updated_at"] = timestamp
+        refresh(plan)
+        return plan
+
+    mutate(path, f"mark step {args.step}", update)
+
+
+def command_add_step(args: argparse.Namespace) -> None:
+    path = resolve_plan(args.plan)
+    if args.step_id < 1:
+        fail("step ID must be positive")
+
+    def update(plan: dict[str, object]) -> dict[str, object]:
+        timestamp = now()
+        execution = object_value(plan["execution"], "execution")
+        steps = [object_value(step, "step") for step in list_value(execution["steps"], "execution.steps")]
+        if any(step.get("id") == args.step_id for step in steps):
+            fail(f"step already exists: {args.step_id}")
+        dependencies = [int(value) for value in args.depends_on.split(",") if value]
+        known = {step.get("id") for step in steps}
+        if any(dependency not in known for dependency in dependencies):
+            fail("step dependency does not exist")
+        guardrails = object_value(plan["guardrails"], "guardrails")
+        retry_cap = integer_value(guardrails["max_failed_validation_runs_per_step"], "guardrails retry cap")
+        criteria = plan.get("criteria")
+        known_criteria = {item.get("id") for item in criteria if isinstance(item, dict)} if isinstance(criteria, list) else set()
+        satisfies = [value for value in (args.satisfies or "").split(",") if value]
+        unknown = [value for value in satisfies if value not in known_criteria]
+        if unknown:
+            fail(f"unknown criteria: {', '.join(unknown)}")
+        steps.append(
+            {
+                "id": args.step_id,
+                "title": args.title,
+                "status": "pending",
+                "risk": args.risk,
+                "depends_on": dependencies,
+                "satisfies": satisfies,
+                "invariants": args.invariant or [],
+                "non_goals": args.non_goal or [],
+                "edge_cases": args.edge_case or [],
+                "regression_risks": args.regression_risk or [],
+                "changes": args.change or [],
+                "validation": args.validation or ["Run the relevant validation command."],
+                "validation_records": [],
+                "retry": {"attempts": 0, "failed_runs": 0, "max_failed_runs": retry_cap, "last_failure": None},
+                "status_history": [{"at": timestamp, "status": "pending", "reason": "Step created."}],
+                "notes": [],
+            }
+        )
+        steps.sort(key=lambda step: int(step["id"]))
+        execution["steps"] = steps
+        plan["task"] = object_value(plan["task"], "task")
+        plan["task"]["updated_at"] = timestamp
+        refresh(plan)
+        return plan
+
+    mutate(path, f"add step {args.step_id}", update)
+
+
+def command_note(args: argparse.Namespace) -> None:
+    path = resolve_plan(args.plan)
+    if len(args.text) > 280:
+        fail("note must be 280 characters or less")
+
+    def update(plan: dict[str, object]) -> dict[str, object]:
+        timestamp = now()
+        notes = list_value(plan["notes"], "notes")
+        notes.append({"at": timestamp, "step_id": args.step, "text": args.text})
+        plan["task"] = object_value(plan["task"], "task")
+        plan["task"]["updated_at"] = timestamp
+        return plan
+
+    mutate(path, "note", update)
+
+
+def git_capture(workspace: Path, arguments: Sequence[str], limit: int) -> str:
+    try:
+        result = subprocess.run(["git", "-C", str(workspace), *arguments], capture_output=True, text=True, check=False)
+    except OSError:
+        return "Git unavailable."
+    if result.returncode != 0:
+        return "Not a Git working tree."
+    return bounded(result.stdout.strip() or "(none)", limit)
+
+
+def write_handoff(path: Path, plan: dict[str, object], diff_paths: list[str]) -> None:
+    task = object_value(plan["task"], "task")
+    execution = object_value(plan["execution"], "execution")
+    steps = [object_value(step, "step") for step in list_value(execution["steps"], "execution.steps")]
+    current_id = execution.get("current_step")
+    current = next((step for step in steps if step.get("id") == current_id), None)
+    handoff = object_value(plan["session_handoff"], "session_handoff")
+    workspace = workspace_for(plan)
+    status = git_capture(workspace, ["status", "--short"], 5000)
+    diff_stat = git_capture(workspace, ["diff", "--stat"], 3000)
+    selected_diff = "(no selected diff)"
+    if diff_paths:
+        selected_parts = [git_capture(workspace, ["diff", "--no-ext-diff", "--", value], 5000) for value in diff_paths]
+        selected_diff = bounded("\n\n".join(selected_parts), 10000)
+    last_failure = handoff.get("last_failure")
+    failure_text = "None."
+    if isinstance(last_failure, dict):
+        failure_text = bounded(str(last_failure.get("summary", "Unknown failure.")), 280)
+
+    criteria_lines: list[str] = []
+    for raw_criterion in list_value(plan.get("criteria"), "criteria"):
+        criterion = object_value(raw_criterion, "criterion")
+        marker = " [superseded]" if criterion.get("status") == "superseded" else ""
+        criteria_lines.append(f"- {criterion['id']}: {criterion['statement']}{marker}")
+    if not criteria_lines:
+        criteria_lines = ["- None minted. Low-risk task; prose criteria apply."]
+
+    unverified_lines: list[str] = []
+    for step in steps:
+        for raw_record in list_value(step.get("validation_records"), "validation_records"):
+            record = object_value(raw_record, "validation record")
+            for item in list_value(record.get("unverified"), "unverified"):
+                unverified_lines.append(f"- Step {step['id']}: {item}")
+    if not unverified_lines:
+        unverified_lines = ["- None declared."]
+
+    spec_lines: list[str] = []
+    if current is not None:
+        for field in SPEC_FIELDS:
+            entries = list_value(current.get(field), f"step.{field}")
+            for entry in entries:
+                spec_lines.append(f"- {field}: {entry}")
+    if not spec_lines:
+        spec_lines = ["- None declared for the current step."]
+
+    lines = [
+        f"# Task {task['id']}",
+        "",
+        "This is generated handoff context. It contains no prior conversation.",
+        "Read the canonical JSON plan before changing files.",
+        "",
+        f"Task: {task['title']}",
+        f"Objective: {plan['objective']}",
+        f"Phase: {execution['phase']}",
+        f"Current step: {current['id'] if current else 'none'} — {current['title'] if current else 'none'}",
+        f"Current risk: {current['risk'] if current else 'none'}",
+        f"Next action: {handoff['next_action']}",
+        f"Last failure: {failure_text}",
+        "",
+        "## Acceptance criteria",
+        "",
+        *criteria_lines,
+        "",
+        "## Spec for the current step",
+        "",
+        *spec_lines,
+        "",
+        "## Unverified areas",
+        "",
+        *unverified_lines,
+        "",
+        "## Working tree status (bounded; includes untracked files)",
+        "",
+        status,
+        "",
+        "## Git diff summary",
+        "",
+        diff_stat,
+        "",
+        "## Selected Git diff",
+        "",
+        selected_diff,
+        "",
+        "## Operating rules",
+        "",
+        "- JSON is the only mutable task state source.",
+        "- Validate after each implementation step and record a bounded summary.",
+        "- Declare unverified areas explicitly. Use [] for an explicit none.",
+        "- Stop on ambiguity, a blocker, or retry-cap exhaustion.",
+        "- Use /new for a clean session, then /task with this task ID.",
+        "- /new is a TUI built-in that clears context. /task loads this artifact.",
+        "- /task does not resume a session. It loads task state into the current one.",
+        "- Do not commit or push without explicit user approval.",
+        "",
+        "## Review instruction",
+        "",
+        "Return findings first, each with a file path and line reference.",
+        "Order findings by severity. State explicitly if there are none.",
+        "Do not restate the diff. Do not praise. Report what is unproven.",
+        "",
+    ]
+    atomic_text(path, bounded("\n".join(lines), 24000))
+
+
+def command_handoff(args: argparse.Namespace) -> None:
+    path = resolve_plan(args.plan)
+    plan = load_plan(path)
+    report = validation_report_path(path, "handoff", plan)
+    validate_file(path, report)
+    workspace = workspace_for(plan)
+    output = path_from(args.output) if args.output else workspace / ".agent" / "handoffs" / f"{object_value(plan['task'], 'task')['id']}.md"
+    write_handoff(output, plan, args.diff_path or [])
+    relative = path_for_plan(plan, output)
+
+    def update(candidate: dict[str, object]) -> dict[str, object]:
+        handoff = object_value(candidate["session_handoff"], "session_handoff")
+        handoff["generated_at"] = now()
+        handoff["artifact_path"] = relative
+        return candidate
+
+    mutate(path, "handoff", update)
+    print(f"handoff artifact: {output}")
+
+
+def command_task(args: argparse.Namespace) -> None:
+    """Load the task artifact into the current session.
+
+    This does not resume a session. It prints the generated handoff so a clean
+    session can pick the work up from the JSON plan.
+    """
+    path = resolve_plan(args.plan)
+    plan = load_plan(path)
+    report = validation_report_path(path, "task", plan)
+    validate_file(path, report)
+    workspace = workspace_for(plan)
+    handoff = object_value(plan["session_handoff"], "session_handoff")
+    stored = handoff.get("artifact_path")
+    handoff_path = path_from(str(stored)) if isinstance(stored, str) and stored.startswith("/") else workspace / str(stored) if isinstance(stored, str) and stored else workspace / ".agent" / "handoffs" / f"{object_value(plan['task'], 'task')['id']}.md"
+    if not handoff_path.is_file():
+        write_handoff(handoff_path, plan, [])
+    print(bounded(handoff_path.read_text(encoding="utf-8"), 24000), end="")
+
+
+def command_migrate(args: argparse.Namespace) -> None:
+    path = resolve_plan(args.plan)
+    timestamp = now()
+
+    def update(plan: dict[str, object]) -> dict[str, object]:
+        plan["$schema"] = f"artifact-workflow/schema/v{SCHEMA_VERSION}/plan.schema.json"
+        plan["schema_version"] = SCHEMA_VERSION
+        plan.setdefault("criteria", [])
+        plan.setdefault("constraints", [])
+        plan.setdefault("decisions", [])
+        plan.setdefault("notes", [])
+        plan.setdefault("artifacts", {"validation_dir": ".agent/validation", "handoff_dir": ".agent/handoffs"})
+        task = object_value(plan["task"], "task")
+        task.setdefault("updated_at", timestamp)
+        execution = object_value(plan["execution"], "execution")
+        steps = [object_value(step, "step") for step in list_value(execution["steps"], "execution.steps")]
+        for step in steps:
+            step["status"] = "in_progress" if step.get("status") == "in-progress" else step.get("status", "pending")
+            records = step.setdefault("validation_records", [])
+            if step.get("status") == "completed" and isinstance(records, list) and not records:
+                records.append({"id": f"migration-{step['id']}", "at": timestamp, "command": "historical-plan-record", "status": "passed", "summary": str((step.get("validation") or ["Historical completion carried forward."])[0])[:280], "output_path": None, "unverified": []})
+            if isinstance(records, list):
+                for record in records:
+                    if isinstance(record, dict):
+                        record.setdefault("unverified", [])
+            failed_runs = sum(1 for record in records if isinstance(record, dict) and record.get("status") == "failed")
+            retry = step.setdefault("retry", {})
+            if not isinstance(retry, dict):
+                retry = {}
+                step["retry"] = retry
+            retry.setdefault("attempts", len(records))
+            retry.setdefault("failed_runs", failed_runs)
+            retry.setdefault("max_failed_runs", 3)
+            retry.setdefault("last_failure", None)
+            step.setdefault("status_history", [{"at": timestamp, "status": step["status"], "reason": f"Migrated into schema version {SCHEMA_VERSION}."}])
+            step.setdefault("risk", "low")
+            step.setdefault("satisfies", [])
+            for field in SPEC_FIELDS:
+                step.setdefault(field, [])
+            step.setdefault("notes", [])
+            step.setdefault("changes", [])
+            step.setdefault("depends_on", [])
+            step.setdefault("validation", ["Run the relevant validation command."])
+        handoff = plan.setdefault("session_handoff", {})
+        if not isinstance(handoff, dict):
+            handoff = {}
+            plan["session_handoff"] = handoff
+        handoff.setdefault("last_failure", None)
+        handoff.setdefault("discarded_approaches", [])
+        handoff.setdefault("next_action", "Continue the current step.")
+        handoff.setdefault("new_session_command", "/new")
+        handoff["new_session_task_id"] = task.get("id")
+        handoff.setdefault("generated_at", None)
+        handoff.setdefault("artifact_path", None)
+        guardrails = plan.setdefault("guardrails", {})
+        if not isinstance(guardrails, dict):
+            guardrails = {}
+            plan["guardrails"] = guardrails
+        guardrails.setdefault("context_reset_threshold", 0.5)
+        guardrails.setdefault("context_reset_action", "stop_at_safe_boundary_and_request_explicit_new_session")
+        guardrails.setdefault("max_failed_validation_runs_per_step", 3)
+        guardrails.setdefault("max_consecutive_read_only_turns", 6)
+        guardrails.setdefault("terminal_task_states", ["completed", "blocked"])
+        guardrails.setdefault("single_writer", True)
+        guardrails.setdefault("allow_unrequested_commits", False)
+        guardrails.setdefault("allow_unrequested_pushes", False)
+        guardrails.setdefault("validation_command_policy", "approval_or_allowlist")
+        for step in steps:
+            object_value(step["retry"], "retry")["max_failed_runs"] = guardrails["max_failed_validation_runs_per_step"]
+        refresh(plan)
+        return plan
+
+    mutate(path, "migrate", update, allow_invalid=True)
+
+
+def command_unlock(args: argparse.Namespace) -> None:
+    """Report the lock state. Never remove the lock file.
+
+    Mutual exclusion lives in the open file description, not in the file name.
+    Unlinking the file lets the next writer create a new inode and take a
+    second, independent lock, so two writers can read-modify-write one plan.
+    The lock file is a permanent mutex handle.
+    """
+    path = resolve_plan(args.plan)
+    lock_path = Path(f"{path}.lock")
+    if not lock_path.exists():
+        print(f"lock file absent: {lock_path}")
+        return
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.seek(0)
+            holder = " ".join(handle.read().split())
+            fail(f"lock is held: {lock_path}\n{holder}")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        print(f"lock is free: {lock_path}")
+        print("The lock file is permanent. Removing it lets the next writer take a second lock.")
+    finally:
+        handle.close()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Artifact-driven OpenCode workflow")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    init = commands.add_parser("init")
+    init.add_argument("--slug")
+    init.add_argument("--title", required=True)
+    init.add_argument("--objective")
+    init.add_argument("--workspace")
+    init.add_argument("--task-id")
+    init.add_argument("--plan")
+    init.add_argument("--base-revision")
+    init.add_argument("--branch")
+    init.add_argument("--step", action="append")
+    init.add_argument("--depends-on", action="append")
+    init.add_argument("--step-meta", action="append", help="ID|key=value, key in risk, satisfies, invariants, non_goals, edge_cases, regression_risks")
+    init.add_argument("--criterion", action="append", help="Acceptance criterion statement; IDs are minted as AC-1, AC-2, ...")
+    init.add_argument("--constraint", action="append")
+    init.add_argument("--decision", action="append")
+    init.set_defaults(handler=command_init)
+
+    validate = commands.add_parser("validate")
+    validate.add_argument("plan")
+    validate.add_argument("--report")
+    validate.set_defaults(handler=command_validate)
+
+    render = commands.add_parser("render")
+    render.add_argument("plan")
+    render.add_argument("--output")
+    render.set_defaults(handler=command_render)
+
+    state = commands.add_parser("state")
+    state.add_argument("plan")
+    state.add_argument("--json", action="store_true")
+    state.set_defaults(handler=command_state)
+
+    mark = commands.add_parser("mark")
+    mark.add_argument("plan")
+    mark.add_argument("step", type=int)
+    mark.add_argument("status")
+    mark.add_argument("--command")
+    mark.add_argument("--summary")
+    mark.add_argument("--result", choices=sorted(VALIDATION_STATUSES))
+    mark.add_argument("--output")
+    mark.add_argument("--unverified", action="append", help="What remains assumed rather than demonstrated. Omit for an explicit none.")
+    mark.add_argument("--reason")
+    mark.set_defaults(handler=command_mark)
+
+    add_step = commands.add_parser("add-step")
+    add_step.add_argument("plan")
+    add_step.add_argument("--id", dest="step_id", type=int, required=True)
+    add_step.add_argument("--title", required=True)
+    add_step.add_argument("--depends-on", default="")
+    add_step.add_argument("--risk", choices=sorted(RISK_LEVELS), default="low")
+    add_step.add_argument("--satisfies", default="", help="Comma-separated AC-n IDs")
+    add_step.add_argument("--invariant", action="append")
+    add_step.add_argument("--non-goal", action="append")
+    add_step.add_argument("--edge-case", action="append")
+    add_step.add_argument("--regression-risk", action="append")
+    add_step.add_argument("--change", action="append")
+    add_step.add_argument("--validation", action="append")
+    add_step.set_defaults(handler=command_add_step)
+
+    note = commands.add_parser("note")
+    note.add_argument("plan")
+    note.add_argument("text")
+    note.add_argument("--step", type=int)
+    note.set_defaults(handler=command_note)
+
+    handoff = commands.add_parser("handoff")
+    handoff.add_argument("plan")
+    handoff.add_argument("--output")
+    handoff.add_argument("--diff-path", action="append")
+    handoff.set_defaults(handler=command_handoff)
+
+    task = commands.add_parser("task", help="Print the task artifact for a clean session")
+    task.add_argument("plan")
+    task.set_defaults(handler=command_task)
+
+    migrate = commands.add_parser("migrate")
+    migrate.add_argument("plan")
+    migrate.set_defaults(handler=command_migrate)
+
+    unlock = commands.add_parser("unlock")
+    unlock.add_argument("plan")
+    unlock.set_defaults(handler=command_unlock)
+    return parser
+
+
+def main(argv: Sequence[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        args.handler(args)
+    except WorkflowError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
